@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+from torch.multiprocessing import spawn as mp_spawn
 import types
 import os, gc, uuid
 from .utils import log, apply_lora
@@ -31,6 +32,26 @@ try:
     from server import PromptServer
 except:
     PromptServer = None
+
+
+def dist_worker(rank, world_size, args_dict):
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['LOCAL_RANK'] = str(rank)
+    print("MY CURRENT RANK IS",rank)
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method="tcp://127.0.0.1:29500",
+        rank=rank,
+        world_size=world_size,
+    )
+    print("MY CURRENT RANK IS",rank)
+
+    model_loader = WanVideoModelLoader()
+    model_loader.loadmodel(**args_dict)
+
+    dist.destroy_process_group()
 
 #from city96's gguf nodes
 def update_folder_names_and_paths(key, targets=[]):
@@ -701,53 +722,59 @@ class WanVideoModelLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": (folder_paths.get_filename_list("unet_gguf") + folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' -folder",}),
-
-            "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
-            "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2", "fp8_e4m3fn_fast_no_ffn", "fp8_e4m3fn_scaled"], {"default": "disabled", "tooltip": "optional quantization method"}),
-            "load_device": (["main_device", "offload_device"], {"default": "main_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
+                "model": (folder_paths.get_filename_list("unet_gguf") + folder_paths.get_filename_list("diffusion_models"),
+                          {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' -folder",}),
+                "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
+                "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2", "fp8_e4m3fn_fast_no_ffn", "fp8_e4m3fn_scaled"],
+                                  {"default": "disabled", "tooltip": "optional quantization method"}),
+                "load_device": (["main_device", "offload_device"],
+                                {"default": "main_device", "tooltip": "Initial device to load the model to."}),
             },
             "optional": {
-                "attention_mode": ([
-                    "sdpa",
-                    "flash_attn_2",
-                    "flash_attn_3",
-                    "sageattn",
-                    "flex_attention",
-                    "radial_sage_attention",
-                    ], {"default": "sdpa"}),
-                "compile_args": ("WANCOMPILEARGS", ),
-                "block_swap_args": ("BLOCKSWAPARGS", ),
+                "attention_mode": (["sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "flex_attention", "radial_sage_attention"], {"default": "sdpa"}),
+                "compile_args": ("WANCOMPILEARGS",),
+                "block_swap_args": ("BLOCKSWAPARGS",),
                 "lora": ("WANVIDLORA", {"default": None}),
-                "vram_management_args": ("VRAM_MANAGEMENTARGS", {"default": None, "tooltip": "Alternative offloading method from DiffSynth-Studio, more aggressive in reducing memory use than block swapping, but can be slower"}),
-                "vace_model": ("VACEPATH", {"default": None, "tooltip": "VACE model to use when not using model that has it included"}),
-                "fantasytalking_model": ("FANTASYTALKINGMODEL", {"default": None, "tooltip": "FantasyTalking model https://github.com/Fantasy-AMAP"}),
-                "multitalk_model": ("MULTITALKMODEL", {"default": None, "tooltip": "Multitalk model"}),
+                "vram_management_args": ("VRAM_MANAGEMENTARGS", {"default": None}),
+                "vace_model": ("VACEPATH", {"default": None}),
+                "fantasytalking_model": ("FANTASYTALKINGMODEL", {"default": None}),
+                "multitalk_model": ("MULTITALKMODEL", {"default": None}),
                 "usp": ("BOOLEAN", {"default": False}),
             }
         }
 
     RETURN_TYPES = ("WANVIDEOMODEL",)
-    RETURN_NAMES = ("model", )
-    FUNCTION = "loadmodel"
+    RETURN_NAMES = ("model",)
+    FUNCTION = "worker_wrapper"
     CATEGORY = "WanVideoWrapper"
+
+    def worker_wrapper(self, model, base_precision, load_device, quantization,
+                       compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None,
+                       vram_management_args=None, vace_model=None, fantasytalking_model=None,
+                       multitalk_model=None, usp=None):
+
+        args_dict = {
+            "model": model,
+            "base_precision": base_precision,
+            "load_device": load_device,
+            "quantization": quantization,
+            "compile_args": compile_args,
+            "attention_mode": attention_mode,
+            "block_swap_args": block_swap_args,
+            "lora": lora,
+            "vram_management_args": vram_management_args,
+            "vace_model": vace_model,
+            "fantasytalking_model": fantasytalking_model,
+            "multitalk_model": multitalk_model,
+            "usp": usp
+        }
+
+        world_size = 2  # adjust this according to available GPUs
+        mp_spawn(dist_worker, args=(world_size, args_dict), nprocs=world_size, join=True)
 
     def loadmodel(self, model, base_precision, load_device,  quantization,
                   compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, fantasytalking_model=None, multitalk_model=None, usp=None):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
-        rank = int(os.getenv("RANK", 0))
-        world_size = int(os.getenv("WORLD_SIZE", 2))
-        local_rank = int(os.getenv("LOCAL_RANK", 0))
-        device = local_rank
-
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            rank=rank,
-            world_size=world_size
-        )
-
         lora_low_mem_load = merge_loras = False
         if lora is not None:
             for l in lora:
