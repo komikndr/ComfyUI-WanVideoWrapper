@@ -1,4 +1,6 @@
 import torch
+import torch.distributed as dist
+import types
 import os, gc, uuid
 from .utils import log, apply_lora
 import numpy as np
@@ -18,6 +20,7 @@ import comfy.model_management as mm
 from comfy.utils import load_torch_file, ProgressBar
 import comfy.model_base
 from comfy.sd import load_lora_for_models
+
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -720,6 +723,7 @@ class WanVideoModelLoader:
                 "vace_model": ("VACEPATH", {"default": None, "tooltip": "VACE model to use when not using model that has it included"}),
                 "fantasytalking_model": ("FANTASYTALKINGMODEL", {"default": None, "tooltip": "FantasyTalking model https://github.com/Fantasy-AMAP"}),
                 "multitalk_model": ("MULTITALKMODEL", {"default": None, "tooltip": "Multitalk model"}),
+                "usp": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -729,9 +733,21 @@ class WanVideoModelLoader:
     CATEGORY = "WanVideoWrapper"
 
     def loadmodel(self, model, base_precision, load_device,  quantization,
-                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, fantasytalking_model=None, multitalk_model=None):
+                  compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, fantasytalking_model=None, multitalk_model=None, usp=None):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
-        
+        rank = int(os.getenv("RANK", 0))
+        world_size = int(os.getenv("WORLD_SIZE", 2))
+        local_rank = int(os.getenv("LOCAL_RANK", 0))
+        device = local_rank
+
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            rank=rank,
+            world_size=world_size
+        )
+
         lora_low_mem_load = merge_loras = False
         if lora is not None:
             for l in lora:
@@ -935,6 +951,21 @@ class WanVideoModelLoader:
         with init_empty_weights():
             transformer = WanModel(**TRANSFORMER_CONFIG)
         transformer.eval()
+
+        #USPs
+        if usp:
+            from xfuser.core.distributed import get_sequence_parallel_world_size
+
+            from .distributed.xdit_context_parallel import (
+                usp_attn_forward,
+                usp_dit_forward,
+            )
+
+            for block in transformer.model.blocks:
+                block.self_attn.forward = types.MethodType(
+                    usp_attn_forward, block.self_attn)
+            transformer.model.forward = types.MethodType(usp_dit_forward, self.model)
+            sp_size = get_sequence_parallel_world_size()
 
         #ReCamMaster
         if "blocks.0.cam_encoder.weight" in sd:
